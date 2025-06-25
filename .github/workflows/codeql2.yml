@@ -10,7 +10,9 @@ on:
 
 jobs:
   analyze:
-    runs-on: ubuntu-latest-xl 
+    runs-on:
+      group: ubuntu-runners
+      labels: ubuntu-20.04-16core
     name: Coding Standards Analysis
     permissions:
       actions: read
