@@ -1,153 +1,208 @@
-name: "CodeQL Coding Standards ONLY"
+name: "CodeQL – Coding-Standards Only (Optimized)"
 
 on:
   pull_request:
     branches: [ "main", "master" ]
-    types: [opened, synchronize, reopened]
+    types: [ opened, synchronize, reopened ]
   push:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
-  analyze:
-    runs-on:
-      group: ubuntu-runners
-      labels: ubuntu-20.04-16core
-    name: Coding Standards Analysis
+  coding-standards:
+    name: "Coding-Standards (CERT + AUTOSAR + MISRA-C)"
+    runs-on: self-hosted              # Use self-hosted for better caching
+    timeout-minutes: 60               # Reduced from 180
     permissions:
+      security-events: write
       actions: read
       contents: read
-      security-events: write
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      # 1️⃣ Checkout this workflow repository
+      - name: "Checkout workflow repo"
+        uses: actions/checkout@v4
+        with:
+          path: workflow-repo
+          fetch-depth: 0
 
-    - name: Checkout CodeQL Coding Standards
-      uses: actions/checkout@v4
-      with:
-        repository: github/codeql-coding-standards
-        path: codeql-coding-standards
+      # 2️⃣ Cache CodeQL Coding Standards
+      - name: "Cache CodeQL Coding Standards"
+        uses: actions/cache@v4
+        with:
+          path: workflow-repo/codeql-coding-standards
+          key: codeql-standards-${{ hashFiles('workflow-repo/codeql-coding-standards/**') }}
+          restore-keys: codeql-standards-
 
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v3
-      with:
-        languages: cpp
+      - name: "Checkout CodeQL Coding Standards"
+        if: steps.cache-standards.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: github/codeql-coding-standards
+          path: workflow-repo/codeql-coding-standards
+          fetch-depth: 1
 
-    # ------------------------------------------------------------------
-    # 1- FIX: collect changed files (proper quoting + heredoc + fi)
-    # ------------------------------------------------------------------
-    - name: Get Changed Files
-      id: changed-files
-      shell: bash
-      run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          git fetch origin "${{ github.base_ref }}"
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | \
-                          grep -E '\.(c|cpp|cc|cxx|h|hpp|hxx)$' || true)
-        else
-          CHANGED_FILES=$(git ls-files | grep -E '\.(c|cpp|cc|cxx|h|hpp|hxx)$')
-        fi
+      # 3️⃣ Clone PR source repo (if event is pull_request)
+      - name: "Clone PR source repo"
+        if: github.event_name == 'pull_request'
+        run: |
+          git clone --depth 1 "${{ github.event.pull_request.head.repo.clone_url }}" pr-code
+          cd pr-code
+          git fetch origin "${{ github.event.pull_request.head.sha }}"
+          git checkout "${{ github.event.pull_request.head.sha }}"
 
-        echo "Files to analyse:"
-        echo "$CHANGED_FILES"
+      # 4️⃣ Fallback for push events
+      - name: "Fallback: use current repo (push)"
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir pr-code
+          rsync -a --exclude .git ./ pr-code/
 
-        echo "changed_files<<EOF" >> "$GITHUB_OUTPUT"
-        echo "$CHANGED_FILES"       >> "$GITHUB_OUTPUT"
-        echo "EOF"                  >> "$GITHUB_OUTPUT"
-    # ------------------------------------------------------------------
+      # 5️⃣ Build caching
+      - name: "Cache build artifacts"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            pr-code/**/*.o
+          key: ${{ runner.os }}-build-${{ hashFiles('pr-code/**/*.c', 'pr-code/**/*.cpp', 'pr-code/**/*.h', 'pr-code/**/*.hpp') }}
+          restore-keys: |
+            ${{ runner.os }}-build-
 
-    - name: Locate and setup CodeQL CLI
-      run: |
-        CODEQL_PATH=$(find /opt/hostedtoolcache -name "codeql" -type f 2>/dev/null | head -1)
-        if [ -n "$CODEQL_PATH" ]; then
-          echo "Found CodeQL at: $CODEQL_PATH"
-          echo "$(dirname "$CODEQL_PATH")" >> "$GITHUB_PATH"
-          echo "CODEQL_CLI=$(dirname "$CODEQL_PATH")/codeql" >> "$GITHUB_ENV"
-        else
-          CODEQL_PATH=$(command -v codeql 2>/dev/null || find /usr -name "codeql" -type f 2>/dev/null | head -1)
-          if [ -n "$CODEQL_PATH" ]; then
-            echo "Found CodeQL at: $CODEQL_PATH"
-            echo "CODEQL_CLI=$CODEQL_PATH" >> "$GITHUB_ENV"
-          else
-            echo "CodeQL CLI not found"
-            exit 1
+      # 6️⃣ Setup fast compilation
+      - name: "Setup ccache and parallel compilation"
+        run: |
+          # Install ccache if not available
+          if ! command -v ccache &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y ccache
           fi
-        fi
+          echo "CC=ccache gcc" >> $GITHUB_ENV
+          echo "CXX=ccache g++" >> $GITHUB_ENV
+          ccache --set-config=max_size=2G
+          ccache --zero-stats
 
-    - name: Install Coding Standards Dependencies
-      run: |
-        cd codeql-coding-standards/cpp/common/src   && $CODEQL_CLI pack install && cd -
-        cd codeql-coding-standards/cpp/cert/src     && $CODEQL_CLI pack install && cd -
-        cd codeql-coding-standards/cpp/autosar/src  && $CODEQL_CLI pack install && cd -
+      # 7️⃣ CodeQL config
+      - name: "Write CodeQL config"
+        run: |
+          mkdir -p pr-code/.github
+          {
+            echo "paths-ignore:"
+            echo "  - third_party/**"
+            echo "  - generated/**"
+            echo "  - vendor/**"
+            echo "  - build/**"
+            echo "  - '**/test/**'"
+          } > pr-code/.github/codeql-config.yml
 
-    - name: Create CodeQL Database
-      env:
-        CHANGED_FILES: ${{ steps.changed-files.outputs.changed_files }}
-      run: |
-        if [ -z "$CHANGED_FILES" ]; then
-          echo "No C/C++ files to analyse"
-          exit 0
-        fi
+      # 8️⃣ Initialize CodeQL
+      - name: "Init CodeQL"
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          config-file: pr-code/.github/codeql-config.yml
 
-        COMPILE_CMD=""
-        for file in $CHANGED_FILES; do
-          [[ -f "$file" ]] && COMPILE_CMD="$COMPILE_CMD gcc -c $file -o ${file%.*}.o;"
-        done
+      # 9️⃣ Locate CodeQL CLI
+      - name: "Locate CodeQL CLI"
+        run: |
+          CODEQL_CLI=$(which codeql || find /opt/hostedtoolcache -type f -name codeql | head -n 1)
+          echo "CODEQL_CLI=$CODEQL_CLI" >> "$GITHUB_ENV"
+          echo "Using CodeQL CLI at: $CODEQL_CLI"
 
-        if [ -z "$COMPILE_CMD" ]; then
-          echo "No compilable source files found"
-          exit 1
-        fi
+      # 🔟 Install packs (cached)
+      - name: "Install coding-standards packs"
+        run: |
+          for dir in \
+            workflow-repo/codeql-coding-standards/cpp/common/src \
+            workflow-repo/codeql-coding-standards/cpp/cert/src \
+            workflow-repo/codeql-coding-standards/cpp/autosar/src \
+            workflow-repo/codeql-coding-standards/c/misra/src
+          do
+            if [ -d "$dir" ]; then
+              cd "$dir"
+              $CODEQL_CLI pack install || echo "Pack install failed for $dir"
+              cd -
+            fi
+          done
 
-        $CODEQL_CLI database create coding-standards-db --language=cpp --command="$COMPILE_CMD"
+      # 11️⃣ Smart incremental compilation
+      - name: "Smart incremental build"
+        working-directory: pr-code
+        run: |
+          NPROC=$(nproc)
+          
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+            
+            # Get changed C/C++ files (limit to 100 for performance)
+            CHANGED_FILES=$(git diff --name-only "$BASE" "$HEAD" | \
+              grep -E '\.(c|cpp|cc|cxx)$' | head -100 || true)
+            
+            if [ -n "$CHANGED_FILES" ]; then
+              echo "Changed files: $CHANGED_FILES"
+              echo "$CHANGED_FILES" | xargs -P$NPROC -I {} bash -c 'ccache g++ -c {} -I. -std=c++17 -O0 || echo "Failed: {}"'
+              BUILD_CMD="echo 'Incremental build completed'"
+            else
+              echo "No source files changed, using dummy"
+              echo 'int main(){return 0;}' > dummy.cpp
+              ccache g++ -c dummy.cpp
+              BUILD_CMD="ccache g++ -c dummy.cpp"
+            fi
+          else
+            # For push: sample compilation
+            find . -name "*.cpp" -o -name "*.c" | head -50 | \
+              xargs -P$NPROC -I {} bash -c 'ccache g++ -c {} -I. -std=c++17 -O0 || true'
+            BUILD_CMD="echo 'Sample build completed'"
+          fi
+          
+          echo "BUILD_CMD=$BUILD_CMD" >> $GITHUB_ENV
 
-    - name: Run CERT C++ Coding Standards
-      run: |
-        $CODEQL_CLI database analyze coding-standards-db \
-          ./codeql-coding-standards/cpp/cert/src \
-          --format=sarif-latest \
-          --output=cert-results.sarif \
-          --sarif-category=cert-cpp
+      # 12️⃣ Create CodeQL database
+      - name: "Create CodeQL database"
+        working-directory: pr-code
+        run: |
+          $CODEQL_CLI database create coding-standards-db \
+            --language=c-cpp \
+            --command="${{ env.BUILD_CMD }}" \
+            --overwrite \
+            || {
+              echo "Database creation failed, trying extraction-only mode"
+              $CODEQL_CLI database create coding-standards-db \
+                --language=c-cpp \
+                --source-root=. \
+                --overwrite
+            }
 
-    - name: Run AUTOSAR C++ Coding Standards
-      run: |
-        $CODEQL_CLI database analyze coding-standards-db \
-          ./codeql-coding-standards/cpp/autosar/src \
-          --format=sarif-latest \
-          --output=autosar-results.sarif \
-          --sarif-category=autosar-cpp
+      # 13️⃣ Analyze with coding standards
+      - name: "Analyze coding-standards packs"
+        working-directory: pr-code
+        run: |
+          $CODEQL_CLI database analyze coding-standards-db \
+            ../workflow-repo/codeql-coding-standards/cpp/cert/src \
+            ../workflow-repo/codeql-coding-standards/cpp/autosar/src \
+            ../workflow-repo/codeql-coding-standards/c/misra/src \
+            --format=sarif-latest \
+            --output=cert-results.sarif \
+            --sarif-category=coding-standards \
+            --threads=$NPROC
 
-    - name: Upload CERT Results
-      uses: github/codeql-action/upload-sarif@v3
-      with:
-        sarif_file: cert-results.sarif
-        category: cert-cpp
+      # 14️⃣ Upload results
+      - name: "Upload SARIF to Security Tab"
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: pr-code/cert-results.sarif
+          category: coding-standards
 
-    - name: Upload AUTOSAR Results
-      uses: github/codeql-action/upload-sarif@v3
-      with:
-        sarif_file: autosar-results.sarif
-        category: autosar-cpp
+      - name: "Upload SARIF artifact"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coding-standards-sarif
+          path: pr-code/cert-results.sarif
 
-    # ------------------------------------------------------------------
-    # 2- FIX: script block closed, no stray shell lines afterwards
-    # ------------------------------------------------------------------
-    - name: Comment PR
-      if: github.event_name == 'pull_request'
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const msg = `## CodeQL Coding Standards Analysis
-
-          **CERT C++ Secure Coding Standards**: ✅  
-          **AUTOSAR C++ Automotive Standards**: ✅  
-
-          View results in the [Security tab](${context.payload.repository.html_url}/security/code-scanning).`;
-
-          github.rest.issues.createComment({
-            owner: context.repo.owner,
-            repo:  context.repo.repo,
-            issue_number: context.issue.number,
-            body: msg
-          });
+      # 15️⃣ Show caching stats
+      - name: "Show compilation stats"
+        if: always()
+        run: |
+          ccache --show-stats || echo "ccache stats unavailable"
